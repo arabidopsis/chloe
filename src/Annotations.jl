@@ -1,6 +1,9 @@
 import Printf: @sprintf
 import StatsBase
 import IntervalTrees: IntervalBTree, AbstractInterval, Interval
+import Crayons: @crayon_str
+
+const failed = crayon"bold red"
 
 mutable struct Feature <: AbstractInterval{Int32}
     path::String
@@ -176,7 +179,6 @@ end
 
 datasize(s::FeatureTemplate) = sizeof(FeatureTemplate) + sizeof(s.path)
 
-
 function readTemplates(file::String)::Tuple{Dict{String,FeatureTemplate},Dict{String,Int32}}
 
     if !isfile(file)
@@ -218,6 +220,7 @@ struct FeatureStack
     stack::Vector{Int32}
     template::FeatureTemplate
 end
+
 datasize(f::FeatureStack) = sizeof(FeatureStack) + sizeof(f.path) + length(f.stack) * sizeof(Int32)
 
 DFeatureStack = Dict{String,FeatureStack}
@@ -320,7 +323,7 @@ function getDepthAndCoverage(feature_stack::FeatureStack, left::Int32, len::Int3
     #     end
     # end
     depth = if max_count == 0
-        0
+        0.0
     else
         sum_count / (max_count * len)
     end
@@ -343,7 +346,7 @@ function alignTemplateToStack(feature_stack::FeatureStack, shadowstack::ShadowSt
         mt = genome_wrap(stack_length, nt + median_length - 1)
         # st = shadowstack[nt]
         # score -= stack[nt - 1] + st
-        # score += stack[mt] + st
+        # score += stack[mt    ] + st
 
         score -= stack[nt - 1] + shadowstack[nt - 1]
         score += stack[mt    ] + shadowstack[mt    ]
@@ -355,16 +358,19 @@ function alignTemplateToStack(feature_stack::FeatureStack, shadowstack::ShadowSt
     max_score <= 0 && return 0, 0
     return best_hit, median_length
 end
+
 function findFeatureInStack(feature_stack::FeatureStack, shadowstack::ShadowStack)::Union{Nothing,Feature}
     left_border, len = alignTemplateToStack(feature_stack, shadowstack)
     if left_border == 0
+        @debug failed("$(feature_stack.path): no feature for stack")
         return nothing
     end
     depth, coverage = getDepthAndCoverage(feature_stack, left_border, len)
-    if ((depth >= feature_stack.template.threshold_counts) && (coverage >= feature_stack.template.threshold_coverage))
+    t = feature_stack.template
+    if (depth >= t.threshold_counts) && (coverage >= t.threshold_coverage)
         return Feature(feature_stack.path, left_border, len, 0)
     end
-    @debug "$(feature_stack.path): below threshold depth=$(@sprintf "%.3f" depth) coverage=$(@sprintf "%.3f" coverage)"
+    @debug failed("$(feature_stack.path): below threshold depth=$(@sprintf "%.3f" depth) coverage=$(@sprintf "%.3f" coverage)")
 
     nothing
 end
@@ -464,16 +470,16 @@ function groupFeaturesIntoGeneModels(features::AFeature)::AAFeature
     return gene_models
 end
 
-function translateFeature(genome::DNAString, feat::Feature)
+function translateFeature(genomeloop::DNAString, feat::Feature)
     @assert feat.start > 0
     feat.length < 3 && return ""
 
     fend = feat.start + feat.length - 3
-    if fend > length(genome) - 2
-        fend = length(genome) - 2
-        @warn "translateFeature: feature points past genome"
+    if fend > length(genomeloop) - 2
+        fend = length(genomeloop) - 2
+        @warn "translateFeature: feature points past genome loop"
     end
-    translateDNA(genome, feat.start + feat.phase, fend)
+    translateDNA(genomeloop, feat.start + feat.phase, fend)
 end
 
 function translateModel(genomeloop::DNAString, model::AFeature)::String
@@ -492,8 +498,6 @@ function translateModel(genomeloop::DNAString, model::AFeature)::String
     translateDNA(dna)
 end
 
-# define parameter weights
-# const start_score = Dict("ATG"=>1.0,"ACG"=>0.1,"GTG"
 
 function startScore(cds::Feature, codon::SubString)
     if codon == "ATG"
@@ -511,7 +515,7 @@ function startScore(cds::Feature, codon::SubString)
             return 0.01
         end
     else
-        return 0
+        return 0.0
     end
 end
 
@@ -578,7 +582,7 @@ function findStartCodon!(cds::Feature, genome_length::Int32, genomeloop::DNAStri
     start3 = cds.start + cds.phase
     codon = SubString(genomeloop, start3, start3 + 2)
     if isStartCodon(codon, true, true)  # allow ACG and GTG codons if this is predicted start
-        cds.start = start3
+        cds.start = genome_wrap(genome_length, start3)
         cds.length -= cds.phase
         cds.phase = 0;
         return cds
@@ -768,7 +772,7 @@ function refineGeneModels!(gene_models::AAFeature, genome_length::Int32, targetl
 end
 
 
-
+# represents a line in the output .sff file
 struct SFF
     gene::String
     feature::Feature
