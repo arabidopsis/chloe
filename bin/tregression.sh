@@ -1,4 +1,8 @@
 #!/bin/bash
+if [ $# -eq 0 ]; then
+    echo "expecting a list of fasta files" 2>&1
+    exit 1
+fi
 if [ ! -d testo ]; then
     mkdir testo
 fi
