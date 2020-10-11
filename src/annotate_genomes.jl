@@ -384,11 +384,37 @@ function do_annotations(target_id::String, strand::Char, idx2ref::Dict{Int,Singl
     annotations
 end
 
-function do_strand(target_id::String, start_ns::UInt64, target_length::Int32,
+function compute_coverage(tgt::SingleReference, idx2ref::Dict{Int,SingleReference}, blocks_aligned_to_target::AAlignedBlocks)::Dict{String,Float32}
+    coverages = Dict{String,Float32}()
+    for key in idx2ref
+        a = blocks_aligned_to_target[key.first]
+        coverages[key.second.refsrc] = avg_coverage(tgt, a)
+    end
+    coverages
+end
+function fwd_strand(tgt::SingleReference, idx2ref::Dict{Int,SingleReference},
+    blocks_aligned_to_target::FwdRev{AAlignedBlocks},feature_templates::Dict{String,FeatureTemplate})::Strand
+    
+    coverages = compute_coverage(tgt, idx2ref, blocks_aligned_to_target.forward)
+    @debug "[$tgt.refsrc]+ coverages:" coverages
+    do_strand(tgt.refsrc, tgt.target_length,
+        idx2ref, coverages, '+', blocks_aligned_to_target.forward, tgt.refloops.forward,
+        feature_templates)
+end
+function rev_strand(tgt::SingleReference, idx2ref::Dict{Int,SingleReference},
+    blocks_aligned_to_target::FwdRev{AAlignedBlocks},feature_templates::Dict{String,FeatureTemplate})::Strand
+    
+    coverages = compute_coverage(tgt, idx2ref, blocks_aligned_to_target.reverse)
+    @debug "[$tgt.refsrc]- coverages:" coverages
+    do_strand(tgt.refsrc, tgt.target_length,
+        idx2ref, coverages, '-', blocks_aligned_to_target.reverse, tgt.refloops.reverse,
+        feature_templates)
+end
+function do_strand(target_id::String, target_length::Int32,
     idx2ref::Dict{Int,SingleReference}, coverages::Dict{String,Float32},
     strand::Char, blocks_aligned_to_target::AAlignedBlocks,
     targetloop::DNAString, feature_templates::Dict{String,FeatureTemplate})::Strand
-
+    start_ns = time_ns()
     annotations = do_annotations(target_id, strand, idx2ref, blocks_aligned_to_target)
 
     t4 = time_ns()
@@ -405,22 +431,19 @@ function do_strand(target_id::String, start_ns::UInt64, target_length::Int32,
     path_to_stack = Dict{String,FeatureStack}()
     # so... features will be ordered by annotations.path
     for stack in strand_feature_stacks
-        left_border, length = alignTemplateToStack(stack, shadow)
-        left_border == 0 && continue
-        depth, coverage = getDepthAndCoverage(stack, left_border, length)
-        if ((depth >= stack.template.threshold_counts) && (coverage >= stack.template.threshold_coverage))
-            push!(features, Feature(stack.path, left_border, length, 0))
-            if haskey(path_to_stack, stack.path)
-                @error "duplicate feature path: $(stack.path)"
-            end
-            path_to_stack[stack.path] = stack
-        else
-            @debug "[$target_id]$strand below threshold: $(stack.path): depth=$(@sprintf "%.3f" depth) coverage=$(@sprintf "%.3f" coverage)"
+        feature = findFeatureInStack(stack, shadow)
+        feature === nothing && continue
+        push!(features, feature)
+        if haskey(path_to_stack, stack.path)
+            @error "duplicate feature path: $(stack.path)"
         end
+        path_to_stack[stack.path] = stack
     end
 
     t6 = time_ns()
     @info "[$target_id]$strand aligning templates ($(length(features))): $(ns(t6 - t5))"
+
+    # TODO: dictionary of path->[Annotations]
 
     for feature in features
         refineMatchBoundariesByOffsets!(feature, annotations, target_length, coverages)
@@ -501,11 +524,15 @@ function align(tgt::SingleReference, ref::SingleReference)::FwdRev{FwdRev{Aligne
                                     tgt.refloops.reverse, tgt.refSAs.reverse, tgt.refRAs.reverse)
     end
 
-    @info "[$(tgt.refsrc)]± aligned $(src_id) ($(length(ff)),$(length(rf))) $(elapsed(start))"
     # note cross ...
     FwdRev(FwdRev(ff, rf), FwdRev(rr, fr))
 end
-
+function visible_align(tgt::SingleReference, ref::SingleReference)::FwdRev{FwdRev{AlignedBlocks}}
+    start = time_ns()
+    ret = align(tgt, ref)
+    @info "[$(tgt.refsrc)]± aligned $(ref.refsrc) ($(length(ret.forward.forward)),$(length(ret.forward.reverse))) $(elapsed(start))"
+    ret
+end
 function inverted_repeat(target::SingleReference)::AlignedBlock
     f_aligned_blocks, _ = alignLoops(target.refsrc,
                             target.refloops.forward, target.refSAs.forward, target.refRAs.forward,
@@ -577,8 +604,7 @@ function annotate_one(reference::Reference, target_id::String, target_seqf::Stri
 
     num_refs = length(reference.references)
 
-    blocks_aligned_to_targetf = AAlignedBlocks(undef, num_refs)
-    blocks_aligned_to_targetr = AAlignedBlocks(undef, num_refs)
+    blocks_aligned_to_target = FwdRev(AAlignedBlocks(undef, num_refs), AAlignedBlocks(undef, num_refs))
   
     # map index into blocks_aligned_to_target{r,f} to SingleReference
 
@@ -590,34 +616,24 @@ function annotate_one(reference::Reference, target_id::String, target_seqf::Stri
     idx2ref = Dict(i => r.second for (i, r) in enumerate(reference.references))
 
     Threads.@threads for i in collect(idx2ref)
-        a = align(target, i.second)
-        blocks_aligned_to_targetf[i.first] = a.forward
-        blocks_aligned_to_targetr[i.first] = a.reverse
+        a = visible_align(target, i.second)
+        blocks_aligned_to_target.forward[i.first] = a.forward
+        blocks_aligned_to_target.reverse[i.first] = a.reverse
     end
 
-    t3 = time_ns()
     
-    @info "[$target_id] aligned: ($(num_refs)) $(human(datasize(blocks_aligned_to_targetf) + datasize(blocks_aligned_to_targetr))) $(ns(t3 - t2))" 
+    @info "[$target_id] aligned: ($(num_refs)) $(human(datasize(blocks_aligned_to_target.forward)))[+] $(human(datasize(blocks_aligned_to_target.reverse)))[-] $(elapsed(t2))" 
 
-    coverages = Dict{String,Float32}()
-    for key in idx2ref
-        a = blocks_aligned_to_targetf[key.first]
-        coverages[key.second.refsrc] = avg_coverage(target, a)
-    end
-    @debug "[$target_id] coverages:" coverages
 
 
     function watson()
-        models, stacks = do_strand(target_id, t3, target.target_length, idx2ref, coverages,
-            '+', blocks_aligned_to_targetf, target.refloops.forward, reference.feature_templates)
-
+        models, stacks = fwd_strand(target, idx2ref, blocks_aligned_to_target, reference.feature_templates)
         [toSFF(model, target.refloops.forward, stacks) 
             for model in filter(m -> !isempty(m), models)]
     end
 
     function crick()
-        models, stacks = do_strand(target_id, t3, target.target_length, idx2ref, coverages,
-            '-', blocks_aligned_to_targetr, target.refloops.reverse, reference.feature_templates)
+        models, stacks = rev_strand(target, idx2ref, blocks_aligned_to_target, reference.feature_templates)
         [toSFF(model, target.refloops.reverse, stacks) 
             for model in filter(m -> !isempty(m), models)]
     end

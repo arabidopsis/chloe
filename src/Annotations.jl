@@ -64,9 +64,13 @@ function allFeatures(fa::FeatureArray)::Vector{Feature}
     end
     afeatures
 end
+"""
+    readFeatures(sffFile)
 
-function readFeatures(file::String)::FwdRev{FeatureArray}
-    open(file) do f
+Read an .sff file and return a pair of FeatureArrays
+"""
+function readFeatures(sff_file::String)::FwdRev{FeatureArray}
+    open(sff_file) do f
         header = split(readline(f), '\t')
         genome_id = header[1]
         genome_length = parse(Int32, header[2])
@@ -233,8 +237,10 @@ function fillFeatureStack(target_length::Int32, annotations::Vector{Annotation},
     stacks = AFeatureStack()
     sizehint!(stacks, length(feature_templates))
     indexmap = Dict{String,Int}()
-    shadowstack::ShadowStack = fill(Int32(-1), target_length) # will be negative image of all stacks combined,
-    # initialised to small negative number; acts as prior expectation for feature-finding
+    # will be negative image of all stacks combined,
+    # initialised to small negative number; acts as prior expectation 
+    # for feature-finding
+    shadowstack::ShadowStack = fill(Int32(-1), target_length)
     for annotation in annotations
         template = get(feature_templates, annotation.path, nothing)
         # template_index = findfirst(x -> x.path == annotation.path, templates)
@@ -294,44 +300,53 @@ end
 
 function getDepthAndCoverage(feature_stack::FeatureStack, left::Int32, len::Int32)::Tuple{Float64,Float64}
     coverage = 0
-    max_count = 0
-    sum_count = 0
-    stack_stack = feature_stack.stack
-    stack_len = length(stack_stack)
-    @inbounds for nt = left:left + len - 1
-        count = stack_stack[genome_wrap(stack_len, nt)]
+    max_count::Int32 = 0
+    sum_count::Int32 = 0
+    for count in iter_wrap(left:left + len - 1, feature_stack.stack)
         if count > 0
             coverage += 1
             sum_count += count
-        end
-        if count > max_count
-            max_count = count
+            max_count = max(count, max_count)
         end
     end
-    if max_count == 0
-        depth = 0
+    # stack_stack = feature_stack.stack
+    # stack_len = length(stack_stack)
+    # @inbounds for nt = left:left + len - 1
+    #     count = stack_stack[genome_wrap(stack_len, nt)]
+    #     if count > 0
+    #         coverage += 1
+    #         sum_count += count
+    #         max_count = max(count, max_count)
+    #     end
+    # end
+    depth = if max_count == 0
+        0
     else
-        depth = sum_count / (max_count * len)
+        sum_count / (max_count * len)
     end
     return depth, coverage / len
 end
 
 function alignTemplateToStack(feature_stack::FeatureStack, shadowstack::ShadowStack)::Tuple{Int32,Int32}
     stack = feature_stack.stack
-    glen = length(stack)
+    stack_length = length(stack)
     median_length = feature_stack.template.median_length
     score = 0
     @inbounds for nt = 1:median_length
-        gw = genome_wrap(glen, nt)
+        gw = genome_wrap(stack_length, nt)
         score += stack[gw] + shadowstack[gw]
     end
     max_score = score
     best_hit = 1
 
-    @inbounds for nt = 2:glen
-        st = shadowstack[nt]
-        score -= stack[nt - 1] + st
-        score += stack[genome_wrap(glen, nt + median_length - 1)] + st
+    @inbounds for nt = 2:stack_length
+        mt = genome_wrap(stack_length, nt + median_length - 1)
+        # st = shadowstack[nt]
+        # score -= stack[nt - 1] + st
+        # score += stack[mt] + st
+
+        score -= stack[nt - 1] + shadowstack[nt - 1]
+        score += stack[mt    ] + shadowstack[mt    ]
         if score > max_score
             max_score = score
             best_hit = nt
@@ -339,6 +354,19 @@ function alignTemplateToStack(feature_stack::FeatureStack, shadowstack::ShadowSt
     end
     max_score <= 0 && return 0, 0
     return best_hit, median_length
+end
+function findFeatureInStack(feature_stack::FeatureStack, shadowstack::ShadowStack)::Union{Nothing,Feature}
+    left_border, len = alignTemplateToStack(feature_stack, shadowstack)
+    if left_border == 0
+        return nothing
+    end
+    depth, coverage = getDepthAndCoverage(feature_stack, left_border, len)
+    if ((depth >= feature_stack.template.threshold_counts) && (coverage >= feature_stack.template.threshold_coverage))
+        return Feature(feature_stack.path, left_border, len, 0)
+    end
+    @debug "$(feature_stack.path): below threshold depth=$(@sprintf "%.3f" depth) coverage=$(@sprintf "%.3f" coverage)"
+
+    nothing
 end
 
 function getFeaturePhaseFromAnnotationOffsets(feat::Feature, annotations::Vector{Annotation})::Int8
@@ -365,10 +393,10 @@ end
 
 # uses weighted mode, weighting by alignment length and distance from boundary
 function refineMatchBoundariesByOffsets!(feat::Feature, annotations::Vector{Annotation}, 
-            target_length::Integer, coverages::Dict{String,Float32})  # Tuple{Feature,Vector{Int32},Vector{Float32}}
+            target_length::Integer, coverages::Dict{String,Float32})
     # grab all the matching features
     matching_annotations = findall(x -> x.path == feat.path, annotations)
-    isempty(matching_annotations) && return #  feat, [], []
+    isempty(matching_annotations) && return
     overlapping_annotations = Annotation[]
     minstart = target_length
     maxend = 1
@@ -381,6 +409,7 @@ function refineMatchBoundariesByOffsets!(feat::Feature, annotations::Vector{Anno
             push!(overlapping_annotations, annotation)
         end
     end
+    isempty(overlapping_annotations) && return
     n = length(overlapping_annotations)
     end5s = Vector{Int32}(undef, n)
     end5ws = Vector{Float32}(undef, n)
@@ -411,7 +440,6 @@ function refineMatchBoundariesByOffsets!(feat::Feature, annotations::Vector{Anno
     end
     feat.start = genome_wrap(target_length, left)
     feat.length = right - left + 1
-    # return feat # , end5s, end5ws
 end
 
 function groupFeaturesIntoGeneModels(features::AFeature)::AAFeature
@@ -706,14 +734,15 @@ function refineGeneModels!(gene_models::AAFeature, genome_length::Int32, targetl
         
         @inbounds for i in length(model) - 1:-1:1
             feature = model[i]
+            nextf = model[i + 1]
             # check adjacent to last exon, if not...
-            gap = model[i + 1].start - (feature.start + feature.length)
+            gap = nextf.start - (feature.start + feature.length)
             if gap ≠ 0 && gap < 100
-                refineBoundariesbyScore!(feature, model[i + 1], genome_length, feature_stacks)
-                gap = model[i + 1].start - (feature.start + feature.length)
+                refineBoundariesbyScore!(feature, nextf, genome_length, feature_stacks)
+                gap = nextf.start - (feature.start + feature.length)
             end
             if gap ≠ 0
-                @warn "Non-adjacent boundaries for $(feature.path) $(model[i + 1].path)"
+                @warn "Non-adjacent boundaries for $(feature.path) $(nextf.path)"
             end
             # if CDS, check phase is compatible
             if isType(feature, "CDS")
