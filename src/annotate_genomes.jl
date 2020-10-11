@@ -74,44 +74,12 @@ function Base.show(io::IO, r::FwdRev{FwdRev{AlignedBlocks}})
     print(io, "Chloë Alignment: [($ff,$fr),($rf,$rr)] total=$(human(total))")
 end
 
-struct StrandSingleReference
-    refsrc::String
-    refloops::MappedPtrString
-    refSAs::SuffixArray
-    refRAs::SuffixArray
-    ref_features::Union{Nothing,FeatureArray}
-    target_length::Int32
-    strand::Char
-    ismmapped::Bool
-end
-
-datasize(r::StrandSingleReference) = begin
-    (sizeof(StrandReference)
-    + datasize(r.refsrc)
-    + datasize(r.refloops)
-    + datasize(r.refSAs)
-    + datasize(r.refRAs)
-    + datasize(r.ref_features)
-    )
-end
-
-function stranded(strand::Char, r::SingleReference)::StrandSingleReference
-    fa = r.ref_features
-    if strand == '+'
-        StrandSingleReference(r.refsrc, r.refloops.forward, r.refSAs.forward,
-        r.refRAs.forward, fa === nothing ? nothing : fa.forward,
-        r.target_length, strand, r.ismmapped)
-    else
-        StrandSingleReference(r.refsrc, r.refloops.reverse, r.refSAs.reverse,
-        r.refRAs.reverse, fa === nothing ? nothing : fa.reverse, 
-        r.target_length, strand, r.ismmapped)
-    end
-end
-
 struct Reference
+    # key here is a genome_id e.g. NC_0203362.1
     references::Dict{String,SingleReference}
-    # from .tsv file
+    # from optimized tsv file key here is a path  e.g. atpA/?/CDS/1
     feature_templates::Dict{String,FeatureTemplate}
+    # gene_exon e.g. atpA -> count from optimized tsv
     gene_exons::Dict{String,Int32}
 end
 
@@ -345,8 +313,17 @@ end
 
 
 MayBeString = Union{Nothing,String}
-Strand = Tuple{AAFeature,DFeatureStack}
+# Strand = Tuple{AAFeature,DFeatureStack,Vector{Int32}}
 AAlignedBlocks = Vector{FwdRev{AlignedBlocks}}
+
+struct Strand
+    models::AAFeature
+    stacks::DFeatureStack
+    shadow::Vector{Int32}
+    strand::Char
+end
+
+datasize(s::Strand) = sizeof(Strand) + datasize(s.features) + datasize(s.stacks) + length(s.shadow) * sizeof(Int32)
 
 function flatten(vanno::Vector{Vector{Annotation}})::Vector{Annotation}
     ret = Vector{Annotation}(undef, sum(length(v) for v in vanno))
@@ -396,7 +373,7 @@ function fwd_strand(tgt::SingleReference, idx2ref::Dict{Int,SingleReference},
     blocks_aligned_to_target::FwdRev{AAlignedBlocks},feature_templates::Dict{String,FeatureTemplate})::Strand
     
     coverages = compute_coverage(tgt, idx2ref, blocks_aligned_to_target.forward)
-    @debug "[$tgt.refsrc]+ coverages:" coverages
+    @debug "[$(tgt.refsrc)]+ coverages:" coverages
     do_strand(tgt.refsrc, tgt.target_length,
         idx2ref, coverages, '+', blocks_aligned_to_target.forward, tgt.refloops.forward,
         feature_templates)
@@ -405,7 +382,7 @@ function rev_strand(tgt::SingleReference, idx2ref::Dict{Int,SingleReference},
     blocks_aligned_to_target::FwdRev{AAlignedBlocks},feature_templates::Dict{String,FeatureTemplate})::Strand
     
     coverages = compute_coverage(tgt, idx2ref, blocks_aligned_to_target.reverse)
-    @debug "[$tgt.refsrc]- coverages:" coverages
+    @debug "[$(tgt.refsrc)]- coverages:" coverages
     do_strand(tgt.refsrc, tgt.target_length,
         idx2ref, coverages, '-', blocks_aligned_to_target.reverse, tgt.refloops.reverse,
         feature_templates)
@@ -458,9 +435,9 @@ function do_strand(target_id::String, target_length::Int32,
     target_strand_models = refineGeneModels!(target_strand_models, target_length, 
                                             targetloop, annotations,
                                              path_to_stack)
-
+    target_strand_models = filter(m -> !isempty(m), target_strand_models)
     @info "[$target_id]$strand refining gene models: $(elapsed(t7))"
-    return target_strand_models, path_to_stack
+    return Strand(target_strand_models, path_to_stack, shadow, strand)
 end
 
 # MayBeIO: write to file (String), IO buffer or create filename based on fasta filename
@@ -546,7 +523,7 @@ function inverted_repeat(target::SingleReference)::AlignedBlock
     ir = if length(f_aligned_blocks) > 0
         f_aligned_blocks[1]
     else
-        AlignedBlock((Int32(0), Int32(0), Int32(0)))
+        AlignedBlock((zero(Int32), zero(Int32), zero(Int32)))
     end
     ir
 end
@@ -562,6 +539,36 @@ function avg_coverage(target::SingleReference, a::FwdRev{FwdRev{AlignedBlocks}})
 end
 
 Models = Vector{Vector{SFF}}
+
+function annotate_target(reference::Reference, target::SingleReference)::Tuple{FwdRev{Strand},Union{Nothing,AlignedBlock}}
+    num_refs = length(reference.references)
+
+    blocks_aligned_to_target = FwdRev(AAlignedBlocks(undef, num_refs), AAlignedBlocks(undef, num_refs))
+
+    idx2ref = Dict(i => r.second for (i, r) in enumerate(reference.references))
+
+    Threads.@threads for i in collect(idx2ref)
+        a = align(target, i.second)
+        blocks_aligned_to_target.forward[i.first] = a.forward
+        blocks_aligned_to_target.reverse[i.first] = a.reverse
+    end
+    function watson()
+        fwd_strand(target, idx2ref, blocks_aligned_to_target, reference.feature_templates)
+
+    end
+
+    function crick()
+        rev_strand(target, idx2ref, blocks_aligned_to_target, reference.feature_templates)
+    end
+
+    # from https://discourse.julialang.org/t/threads-threads-to-return-results/47382
+    
+    fwd, rev, ir = fetch.((Threads.@spawn w()) for w in 
+            [watson, crick, () -> inverted_repeat(target)])
+    return FwdRev(fwd, rev), ir[3] >= 1000 ? ir : nothing
+end
+
+
 
 """
     annotate_one(references::Reference, seq_id::String, seq::String, [,output_sff_file])
@@ -622,20 +629,17 @@ function annotate_one(reference::Reference, target_id::String, target_seqf::Stri
     end
 
     
-    @info "[$target_id] aligned: ($(num_refs)) $(human(datasize(blocks_aligned_to_target.forward)))[+] $(human(datasize(blocks_aligned_to_target.reverse)))[-] $(elapsed(t2))" 
-
+    @info "[$target_id] aligned: ($(num_refs)) $(human(datasize(blocks_aligned_to_target.forward)))[+] $(human(datasize(blocks_aligned_to_target.reverse)))[-] $(elapsed(t2))"
 
 
     function watson()
-        models, stacks = fwd_strand(target, idx2ref, blocks_aligned_to_target, reference.feature_templates)
-        [toSFF(model, target.refloops.forward, stacks) 
-            for model in filter(m -> !isempty(m), models)]
+        strand = fwd_strand(target, idx2ref, blocks_aligned_to_target, reference.feature_templates)
+        [toSFF(model, target.refloops.forward, strand.stacks) for model in strand.models]
     end
 
     function crick()
-        models, stacks = rev_strand(target, idx2ref, blocks_aligned_to_target, reference.feature_templates)
-        [toSFF(model, target.refloops.reverse, stacks) 
-            for model in filter(m -> !isempty(m), models)]
+        strand = rev_strand(target, idx2ref, blocks_aligned_to_target, reference.feature_templates)
+        [toSFF(model, target.refloops.reverse, strand.stacks) for model in strand.models]
     end
 
     # from https://discourse.julialang.org/t/threads-threads-to-return-results/47382
@@ -662,7 +666,7 @@ function annotate_one(reference::Reference, target_id::String, target_seqf::Stri
     else
         "$(target_id).sff"
     end
-    writeSFF(fname, target_id, target.target_length, reference.gene_exons,
+    writeSFF(fname, target.refsrc, target.target_length, reference.gene_exons,
              FwdRev(sffs_fwd, sffs_rev), ir)
 
     @info success("[$target_id] Overall: $(elapsed(t1))")
