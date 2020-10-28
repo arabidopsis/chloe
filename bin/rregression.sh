@@ -3,13 +3,13 @@
 # and compare the current sff output with the original
 TOTAL=3
 if [ $# -eq 0 ]; then
-    echo "expecting DIR [num] [julia args]" 2>&1
+    echo "expecting DIR [num] [julia args]" 1>&2
     exit 1
 fi
 DIR=$1
 shift
 if [ ! -d $DIR ]; then
-    echo "expecting directory" 2>&1
+    echo "expecting directory" 1>&2
     exit 1
 fi
 
